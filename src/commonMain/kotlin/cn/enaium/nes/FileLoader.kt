@@ -1,16 +1,27 @@
 package cn.enaium.nes
 
-/**
- * Platform-specific ROM loading.
- *
- * - JVM desktop: FileKit native file picker dialog + file path reading.
- * - Native Windows (mingwX64), macOS arm64 (macosArm64) and iOS: FileKit
- *   pickers are available and used.
- * - Native Linux / macOS x64 / tvOS: no FileKit dialogs; the ROM path is
- *   passed as a command-line argument and read via POSIX.
- * - Android (androidNative*): the ROM is picked in the Compose launcher and
- *   passed to SDL_main as an argument; read via kotlinx-io.
- */
-expect suspend fun pickRomFile(): ByteArray?
+import kotlinx.io.buffered
+import kotlinx.io.files.Path
+import kotlinx.io.files.SystemFileSystem
+import kotlinx.io.readByteArray
 
-expect suspend fun readRomFile(path: String): ByteArray?
+/**
+ * Reads the ROM file at [path].
+ *
+ * Uses kotlinx-io's SystemFileSystem — the same backing store FileKit uses —
+ * which is available on every target (JVM, native desktop, Android native).
+ *
+ * Returns null if the file does not exist or cannot be read.
+ */
+suspend fun readRomFile(path: String): ByteArray? {
+    return try {
+        val file = Path(path)
+        if (SystemFileSystem.exists(file)) {
+            SystemFileSystem.source(file).buffered().use { it.readByteArray() }
+        } else {
+            null
+        }
+    } catch (e: Throwable) {
+        null
+    }
+}

@@ -46,19 +46,12 @@ kotlin {
         binaries.executable()
     }
 
-    // Apple desktop/mobile targets can only be built on a macOS host.
+    // Apple desktop targets can only be built on a macOS host. FileKit ships
+    // no macosX64 variant, so only Apple Silicon is supported.
     if (isAppleHost) {
         macosArm64 {
             binaries.executable()
         }
-        macosX64 {
-            binaries.executable()
-        }
-        iosArm64()
-        iosSimulatorArm64()
-        iosX64()
-        tvosArm64()
-        tvosSimulatorArm64()
     }
 
     // Android native targets build libmain.so with an exported SDL_main entry
@@ -89,8 +82,10 @@ kotlin {
     }
 
     sourceSets {
-        // Kotlin 2.4's default hierarchy template does not create the
-        // intermediate source sets automatically; declare them manually.
+
+
+
+        // Shared native entry point (Main.native.kt).
         val nativeMain = create("nativeMain") {
             dependsOn(getByName("commonMain"))
         }
@@ -104,46 +99,8 @@ kotlin {
             macosArm64Main {
                 dependsOn(nativeMain)
             }
-            macosX64Main {
-                dependsOn(nativeMain)
-            }
-            iosArm64Main {
-                dependsOn(nativeMain)
-            }
-            iosSimulatorArm64Main {
-                dependsOn(nativeMain)
-            }
-            iosX64Main {
-                dependsOn(nativeMain)
-            }
-            tvosArm64Main {
-                dependsOn(nativeMain)
-            }
-            tvosSimulatorArm64Main {
-                dependsOn(nativeMain)
-            }
         }
 
-        // Native targets that ship FileKit dialogs (file pickers): Windows
-        // (mingwX64), macOS arm64 (macosArm64) and iOS. Linux native and the
-        // remaining Apple targets fall back to a ROM path argument instead.
-        val nativeDialogsMain = create("nativeDialogsMain") {
-            dependsOn(getByName("nativeMain"))
-        }
-        mingwX64Main {
-            dependsOn(nativeDialogsMain)
-        }
-        if (isAppleHost) {
-            macosArm64Main {
-                dependsOn(nativeDialogsMain)
-            }
-            iosArm64Main {
-                dependsOn(nativeDialogsMain)
-            }
-            iosSimulatorArm64Main {
-                dependsOn(nativeDialogsMain)
-            }
-        }
 
         val androidNativeMain = create("androidNativeMain") {
             dependsOn(getByName("commonMain"))
@@ -161,12 +118,6 @@ kotlin {
             dependsOn(androidNativeMain)
         }
 
-        androidNativeMain {
-            dependencies {
-                implementation(libs.kotlinx.io.core)
-            }
-        }
-
         jvm {
             mainRun {
                 mainClass = "cn.enaium.nes.Main_jvmKt"
@@ -177,22 +128,7 @@ kotlin {
             dependencies {
                 implementation(libs.sdl.kmp)
                 implementation(libs.kotlinx.coroutines.core)
-            }
-        }
-        nativeMain {
-            dependencies {
-                // No FileKit here: macosX64 / iosX64 / tvos have no FileKit
-                // variants, so native file I/O uses plain POSIX instead.
-            }
-        }
-        getByName("nativeDialogsMain").dependencies {
-            implementation(libs.filekit.dialogs)
-            implementation(libs.filekit.core)
-        }
-        jvmMain {
-            dependencies {
-                implementation(libs.filekit.core)
-                implementation(libs.filekit.dialogs)
+                implementation(libs.kotlinx.io.core)
             }
         }
         commonTest {
@@ -208,3 +144,13 @@ tasks.withType(JavaExec::class.java).configureEach {
         jvmArgs("--enable-native-access=ALL-UNNAMED", "-XstartOnFirstThread")
     }
 }
+
+
+
+
+
+
+
+
+
+

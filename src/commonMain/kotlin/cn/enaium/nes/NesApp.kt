@@ -17,7 +17,9 @@ import cn.enaium.sdl.SDLRect
 import cn.enaium.sdl.SDLTextureAccess
 import cn.enaium.sdl.SDLWindowEventType
 import cn.enaium.sdl.SDLWindowFlags
-import kotlinx.coroutines.runBlocking
+import cn.enaium.sdl.SDLPoint
+import kotlin.math.min
+import kotlin.math.roundToInt
 
 const val NES_WIDTH = 256
 const val NES_HEIGHT = 240
@@ -29,16 +31,16 @@ const val NES_HEIGHT = 240
  *
  * Controls:
  *  - ESC / close button: quit
- *  - O: open a ROM via the native file picker (JVM desktop)
  *  - R: reset the console
  *  - Arrow keys: d-pad, X: A, Z: B, Enter: Start, Backspace: Select,
  *    S: turbo A, A: turbo B
+ *
+ * The ROM is passed as the first command-line argument.
  */
-class NesApp(private val initialRom: ByteArray?) {
+class NesApp(private val initialRom: ByteArray?, private val desktop: Boolean = true) {
 
     private val argb = IntArray(NES_WIDTH * NES_HEIGHT)
     private val rgb = ByteArray(NES_WIDTH * NES_HEIGHT * 3)
-    private var pendingRom: ByteArray? = null
 
     fun run() {
         SDL.setMainReady()
@@ -88,6 +90,11 @@ class NesApp(private val initialRom: ByteArray?) {
             }
         }
         val audio = NesAudioOutput(audioStream)
+        // One frame of stereo F32 at 48kHz in bytes: 48000 * 2 channels * 4 bytes / 60fps.
+        val audioFrameBytes = if (audioStream != null) (48000 * 2 * 4) / 60 else 0
+        // Keep roughly 3 frames (~50ms) of audio buffered: enough headroom to
+        // absorb scheduling jitter without adding audible latency.
+        val audioTargetQueued = audioFrameBytes * 3
 
         fun createNes(): NES {
             return NES(
@@ -114,21 +121,23 @@ class NesApp(private val initialRom: ByteArray?) {
         }
         println(
             "Controls: arrows=d-pad, X=A, Z=B, Enter=Start, Backspace=Select, " +
-                "S=Turbo A, A=Turbo B | O=open ROM, R=reset, P=fps, ESC=quit",
+                "S=Turbo A, A=Turbo B | R=reset, P=fps, ESC=quit",
         )
 
-        // The file picker runs on the main thread: native macOS dialogs
-        // (NSOpenPanel) require it, and a modal picker naturally blocks the
-        // SDL loop until the user makes a choice.
-        var pickerRequested = false
-        fun requestRomPicker() {
-            pickerRequested = true
+        // On mobile (Android) the SDL window must match the actual surface
+        // size: SDL3 Android otherwise keeps the requested size (768x720) and
+        // the SurfaceView stretches that buffer to the whole screen, which no
+        // renderer-side letterboxing can compensate for.
+        val initialWindowSize = if (desktop) {
+            SDLPoint(NES_WIDTH * 3, NES_HEIGHT * 3)
+        } else {
+            val bounds = SDL.getPrimaryDisplay().usableBounds
+            SDLPoint(bounds.width, bounds.height)
         }
-
         SDL.createWindow(
             title = "Kotlin NES",
-            width = NES_WIDTH * 3,
-            height = NES_HEIGHT * 3,
+            width = initialWindowSize.x,
+            height = initialWindowSize.y,
             flags = SDLWindowFlags.RESIZABLE,
         ).use { window ->
             SDL.createRenderer(window).use { renderer ->
@@ -141,16 +150,47 @@ class NesApp(private val initialRom: ByteArray?) {
 
                 var running = true
                 var frames = 0
+                // Wall-clock pacing fallback (no audio / headless / no ROM).
+                // A double accumulator compensates for delay() overshoot so the
+                // average frame period is exactly 1000/60 ms.
+                val framePeriodMs = 1000.0 / 60.0
+                var lastTicks = SDL.getTicks()
+                var pacingAccum = 0.0
+                fun paceWithClock() {
+                    val now = SDL.getTicks()
+                    pacingAccum += (now - lastTicks).toLong().toDouble()
+                    lastTicks = now
+                    if (pacingAccum < framePeriodMs) {
+                        SDL.delay((framePeriodMs - pacingAccum).toInt())
+                    }
+                    pacingAccum -= framePeriodMs
+                    if (pacingAccum < -framePeriodMs) {
+                        // Fell too far behind (slow machine or hiccup): reset
+                        // instead of spiralling.
+                        pacingAccum = 0.0
+                    }
+                }
                 while (running) {
                     // ---- events ----
                     while (true) {
                         val event = SDL.pollEvent() ?: break
                         when (event) {
                             is SDLEvent.Quit -> running = false
-                            is SDLEvent.Window ->
-                                if (event.type == SDLWindowEventType.CLOSE_REQUESTED) {
-                                    running = false
+                            is SDLEvent.Window -> when {
+                                event.type == SDLWindowEventType.CLOSE_REQUESTED -> running = false
+                                // On desktop, snap the window to the NES aspect
+                                // ratio when the user resizes it (mobile ignores
+                                // this: the OS controls the window size).
+                                // window.size is used (not the event's pixel
+                                // data) so high-DPI scaling doesn't drift.
+                                event.type == SDLWindowEventType.RESIZED && desktop -> {
+                                    val size = window.size
+                                    val snapped = snapAspectSize(size.x, size.y)
+                                    if (snapped != size) {
+                                        window.size = snapped
+                                    }
                                 }
+                            }
                             is SDLEvent.Key -> when {
                                 event.repeat -> Unit
                                 !event.down -> {
@@ -158,7 +198,6 @@ class NesApp(private val initialRom: ByteArray?) {
                                     if (button != null) nes?.buttonUp(1, button)
                                 }
                                 event.keycode == SDLKeycode.ESCAPE -> running = false
-                                event.keycode == SDLKeycode.o -> requestRomPicker()
                                 event.keycode == SDLKeycode.r -> nes?.reset()
                                 event.keycode == SDLKeycode.p -> {
                                     val fps = nes?.getFPS()
@@ -170,34 +209,6 @@ class NesApp(private val initialRom: ByteArray?) {
                                 }
                             }
                             else -> Unit
-                        }
-                    }
-
-                    // ---- open the file picker on the main thread, then
-                    // load the chosen ROM ----
-                    if (pickerRequested) {
-                        pickerRequested = false
-                        val data = try {
-                            runBlocking { pickRomFile() }
-                        } catch (e: Throwable) {
-                            println("File picker error: ${e.message}")
-                            null
-                        }
-                        if (data != null) {
-                            pendingRom = data
-                        }
-                    }
-
-                    // ---- apply the picked ROM ----
-                    pendingRom?.let { data ->
-                        pendingRom = null
-                        audio.clear()
-                        try {
-                            nes = createNes()
-                            nes!!.loadROM(data)
-                            println("Loaded ROM (${data.size} bytes)")
-                        } catch (e: Throwable) {
-                            println("Failed to load ROM: ${e.message}")
                         }
                     }
 
@@ -217,10 +228,17 @@ class NesApp(private val initialRom: ByteArray?) {
                         texture.update(null, rgb, NES_WIDTH * 3)
                         renderer.drawColor = SDLColor(0, 0, 0)
                         renderer.clear()
-                        val size = window.size
+                        // outputSize is the renderer's pixel space (what dst
+                        // rects are interpreted in); on Android it can differ
+                        // from window.size (rotated/high-DPI surfaces).
+                        val size = renderer.outputSize
+                        // Scale proportionally and center: never stretch the
+                        // frame to the window (Android fullscreen windows have
+                        // a non-4:3 aspect and were vertically stretched).
+                        val fit = fitAspectRect(size.x, size.y)
                         renderer.renderTexture(
                             texture = texture,
-                            dst = SDLFRect(0f, 0f, size.x.toFloat(), size.y.toFloat()),
+                            dst = fit,
                         )
                         renderer.present()
                     } else {
@@ -228,7 +246,7 @@ class NesApp(private val initialRom: ByteArray?) {
                         // pure black screen.
                         renderer.drawColor = SDLColor(14, 18, 38)
                         renderer.clear()
-                        val size = window.size
+                        val size = renderer.outputSize
                         renderer.drawColor = SDLColor(70, 110, 190)
                         renderer.fillRect(
                             SDLRect(
@@ -250,8 +268,7 @@ class NesApp(private val initialRom: ByteArray?) {
                         renderer.present()
                         if (frames % 120 == 0) {
                             println(
-                                "No ROM loaded. Press 'O' to open a .nes file, " +
-                                    "or pass a ROM path as the first argument.",
+                                "No ROM loaded. Pass a .nes file path as the first argument.",
                             )
                         }
                     }
@@ -261,8 +278,19 @@ class NesApp(private val initialRom: ByteArray?) {
                         running = false
                     }
 
-                    // ---- frame pacing (~60 FPS) ----
-                    SDL.delay(16)
+                    // ---- frame pacing ----
+                    // With audio, the stream drains in real time, so wait until
+                    // the buffered audio drops below the target: the loop then
+                    // runs at exactly the audio clock rate and both sound and
+                    // video stay continuous. Without audio, pace off the wall
+                    // clock instead.
+                    if (nes != null && audioStream != null) {
+                        while (audioStream.queued > audioTargetQueued) {
+                            SDL.delay(1)
+                        }
+                    } else {
+                        paceWithClock()
+                    }
                 }
 
                 println("ran $frames frames")
@@ -293,6 +321,33 @@ class NesApp(private val initialRom: ByteArray?) {
             SDLKeycode.BACKSPACE to Controller.BUTTON_SELECT,
             SDLKeycode.s to Controller.BUTTON_TURBO_A,
             SDLKeycode.a to Controller.BUTTON_TURBO_B,
+        )
+    }
+
+    private fun aspectScale(winW: Int, winH: Int): Float {
+        return min(winW / NES_WIDTH.toFloat(), winH / NES_HEIGHT.toFloat())
+    }
+
+    /**
+     * Largest centered destination rect with the NES aspect ratio that fits in
+     * a [winW]x[winH] window (letterboxing).
+     */
+    private fun fitAspectRect(winW: Int, winH: Int): SDLFRect {
+        val scale = aspectScale(winW, winH)
+        val w = NES_WIDTH * scale
+        val h = NES_HEIGHT * scale
+        return SDLFRect((winW - w) / 2f, (winH - h) / 2f, w, h)
+    }
+
+    /**
+     * Nearest window size with the NES aspect ratio, never smaller than
+     * 256x240. Used to snap desktop window resizes to proportional scaling.
+     */
+    private fun snapAspectSize(w: Int, h: Int): SDLPoint {
+        val scale = aspectScale(w, h).coerceAtLeast(1f)
+        return SDLPoint(
+            (NES_WIDTH * scale).roundToInt(),
+            (NES_HEIGHT * scale).roundToInt(),
         )
     }
 }

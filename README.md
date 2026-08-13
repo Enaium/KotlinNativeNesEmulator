@@ -2,30 +2,25 @@
 
 A NES emulator written in Kotlin Multiplatform. The core logic is ported from
 [bfirsh/jsnes](https://github.com/bfirsh/jsnes) (Apache-2.0). Rendering uses
-[sdl-kmp](https://github.com/Enaium/sdl-kmp) (SDL3 2D renderer), and file
-selection/reading uses [FileKit](https://github.com/vinceglb/FileKit).
+[sdl-kmp](https://github.com/Enaium/sdl-kmp) (SDL3 2D renderer). The ROM is
+passed as a command-line argument on every platform (Android picks the ROM in
+its Compose launcher and forwards the path).
 
 All emulator core code (CPU / PPU / APU / Mapper / ROM parsing) lives in
-`commonMain` and is reused across every platform; the window, rendering, audio
-and input layer also lives in `commonMain` (on top of sdl-kmp), with each
-platform only providing an entry point.
+`commonMain` and is reused across every platform; the window, rendering, audio,
+input and ROM file loading (kotlinx-io's `SystemFileSystem`, the same backing
+store FileKit uses) also live in `commonMain`, with each platform only
+providing an entry point.
 
 ## Supported platforms
 
-| Platform | Target | File dialog |
+| Platform | Target | ROM source |
 | --- | --- | --- |
-| JVM desktop (Linux/macOS/Windows) | `jvm` | ✅ FileKit |
-| Native Windows | `mingwX64` | ✅ FileKit |
-| Native macOS (Apple Silicon) | `macosArm64` | ✅ FileKit |
-| Native macOS (Intel) | `macosX64` | ❌ path argument (FileKit has no macosX64 variant) |
-| Native Linux | `linuxX64` | ❌ path argument (FileKit dialogs unsupported on Linux native) |
-| iOS | `iosArm64`, `iosSimulatorArm64` | ✅ FileKit |
-| Android (4 ABIs) | `androidNativeArm64/32/X64/X86` | ✅ FileKit in the Compose launcher |
-| tvOS | declared | path argument (no FileKit variant) |
-
-FileKit's pickers (`filekit-dialogs`) are available on JVM, Android, iOS, macOS
-arm64 and Windows native — but **not** on Linux native (`linuxX64`). On Linux
-native the ROM path is passed as a command-line argument.
+| JVM desktop (Linux/macOS/Windows) | `jvm` | command-line argument |
+| Native Windows | `mingwX64` | command-line argument |
+| Native macOS (Apple Silicon) | `macosArm64` | command-line argument |
+| Native Linux | `linuxX64` | command-line argument |
+| Android (4 ABIs) | `androidNativeArm64/32/X64/X86` | picked in the Compose launcher |
 
 ## Project structure
 
@@ -39,10 +34,10 @@ src/
       ROM.kt, Tile.kt, Controller.kt, GameGenie.kt
       mappers/           # 20+ mappers (NROM/MMC1/MMC3/MMC5...)
       NES.kt             # Top-level wrapper (frame / loadROM / reset / button...)
-    NesApp.kt            # sdl-kmp SDL renderer + audio + keyboard input (commonMain)
-    FileLoader.kt        # expect: ROM file loading
-  jvmMain/               # JVM entry point + FileKit file picker
-  nativeMain/            # Native entry point (reads ROM by path)
+    NesApp.kt            # sdl-kmp SDL renderer + audio + input + aspect-ratio window (commonMain)
+    FileLoader.kt        # ROM file loading via kotlinx-io (commonMain, no expect/actual)
+  jvmMain/               # JVM entry point
+  nativeMain/            # Native entry point (Linux / Windows / macOS)
   androidNativeMain/     # Android SDL_main entry point
 android/                 # Android app module (AGP)
   LauncherActivity       # Compose + FileKit to pick a ROM
@@ -52,11 +47,10 @@ android/                 # Android app module (AGP)
 ## Build & run
 
 Requirements: JDK 17+, Android SDK + NDK (only for Android builds), macOS host
-(only for Apple targets).
+(only for the macOS target).
 
 ```bash
-# Run on the JVM (desktop shows a native file picker; a ROM path may also be passed)
-./gradlew :jvmRun
+# Run on the JVM with a ROM path
 ./gradlew :jvmRun --args="/path/to/rom.nes"
 
 # Headless run (CI / servers) — exits after 300 frames
@@ -68,6 +62,10 @@ SDL_VIDEO_DRIVER=dummy ./build/bin/linuxX64/debugExecutable/NesEmulator.kexe /pa
 
 # Native Windows (cross-compiled on Linux)
 ./gradlew :linkDebugExecutableMingwX64
+
+# Native macOS (Apple Silicon)
+./gradlew :linkDebugExecutableMacosArm64
+./build/bin/macosArm64/debugExecutable/NesEmulator.kexe /path/to/rom.nes
 
 # Android APK (first builds libmain.so for all 4 androidNative ABIs, then packages)
 ./gradlew :android:assembleDebug
@@ -90,19 +88,18 @@ adb install -r android/build/outputs/apk/debug/android-debug.apk
 | X / Z | A / B |
 | Enter / Backspace | Start / Select |
 | S / A | Turbo A / Turbo B |
-| O | Open a ROM (file picker on the JVM desktop) |
 | R | Reset the console |
 | P | Show FPS |
 | ESC | Quit |
 
 ## Android architecture
 
-As suggested, the app uses two activities:
+The app uses two activities:
 
-1. **LauncherActivity (Compose)** — runs on ART (JVM) and uses FileKit's
-   `openFilePicker(type = FileKitType.File("nes"))` to show the system file
-   picker. The selected ROM is copied to the app's internal storage
-   (`filesDir/rom.nes`) and its path is passed to the second activity.
+1. **LauncherActivity (Compose)** — runs on ART (JVM) and uses FileKit to
+   show the system file picker. The selected ROM is copied to the app's
+   internal storage (`filesDir/rom.nes`) and its path is passed to the second
+   activity.
 2. **EmulatorActivity (SDLActivity subclass)** — loads `libmain.so` built by
    the KMP module (SDL3 statically linked in, `SDL_main` exported). It passes
    the ROM path as an argument by overriding `getArguments()`, and the native
@@ -118,17 +115,21 @@ that AAR.
 
 ## Platform notes
 
-- **JVM desktop**: full FileKit file picker dialog support, audio via LWJGL SDL3.
-- **Native Windows / macOS (arm64) / iOS**: FileKit pickers are available and
-  used by the app (press `O`).
-- **Native Linux / macOS (x64) / tvOS**: `filekit-dialogs` has no variant for
-  these targets, so the ROM path is passed as a command-line argument; file
-  reading still uses plain POSIX.
-- **Android**: the ROM is picked with FileKit in the Compose layer; the native
-  layer reads it from the path received as an argument.
+- **File loading**: `readRomFile` in `commonMain` uses kotlinx-io's
+  `SystemFileSystem` (available on JVM, all native targets and Android
+  native). FileKit itself has no Android-native variant and its published
+  jvm/native artifacts are not consumable from Kotlin Multiplatform
+  (expect/actual metadata breaks), so FileKit is only used in the Android
+  Compose launcher where it works.
+- **Desktop window**: resizes snap to the NES 256:240 aspect ratio; the frame
+  is always scaled proportionally and centered (letterboxed).
+- **Android**: the ROM is picked with FileKit in the Compose layer; the SDL
+  window is created at the display size and the frame is letterboxed to the
+  NES aspect.
 - **SDL rendering**: each NES frame is a 256×240 ARGB buffer uploaded to an RGB24
   streaming texture and scaled to the window (RGB24 is used because the LWJGL
   SDL3 renderer mangles the green/blue channels of 32-bit streaming textures).
 - **Audio**: the APU produces ~800 48 kHz stereo samples per frame, packed as
   F32LE and fed to the SDL audio stream. Audio init is best-effort: if no audio
-  device is available the emulator simply runs without sound.
+  device is available the emulator simply runs without sound. Frame pacing is
+  locked to the audio clock so sound and video stay continuous.

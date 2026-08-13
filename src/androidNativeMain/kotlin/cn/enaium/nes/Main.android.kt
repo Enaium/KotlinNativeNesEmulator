@@ -9,6 +9,7 @@ import kotlinx.cinterop.CPointer
 import kotlinx.cinterop.CPointerVar
 import kotlinx.cinterop.get
 import kotlinx.cinterop.toKString
+import kotlinx.coroutines.runBlocking
 
 /**
  * SDL3 Android entry point.
@@ -24,13 +25,15 @@ fun sdlMain(argc: Int, argv: CPointer<CPointerVar<ByteVar>>?): Int {
     if (argc > 1 && argv != null) {
         val path = argv[1]?.toKString()
         if (path != null && path.isNotEmpty()) {
-            rom = readRomFileSync(path)
+            rom = runBlocking { readRomFile(path) }
         }
     }
     if (rom == null) {
         println("No ROM passed to the emulator.")
     }
-    NesApp(rom).run()
+    // desktop=false: the OS controls the window size on Android (the frame is
+    // still scaled proportionally and centered by the renderer).
+    NesApp(rom, desktop = false).run()
     SDL.quit()
     return 0
 }
